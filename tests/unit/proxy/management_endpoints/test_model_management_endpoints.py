@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
+from pydantic import JsonValue
 
 from litellm._uuid import uuid
 from litellm.models.credentials import CredentialItem
@@ -38,6 +39,158 @@ from litellm.proxy.management_endpoints.model_management_endpoints import (
 from litellm.proxy.utils import PrismaClient
 from litellm.router import Router
 from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo, updateDeployment, updateLiteLLMParams
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("api_base", "https://example.invalid/v1"),
+        ("api_key", "synthetic-provider-secret"),
+        ("timeout", 20),
+        ("max_retries", 3),
+        ("drop_params", True),
+        ("tags", ["saved"]),
+        ("temperature", 0.7),
+        ("extra_body", {"provider_option": "saved"}),
+    ),
+)
+def test_patch_null_removes_optional_params_and_provider_extras(field: str, value: JsonValue) -> None:
+    from litellm.proxy.management_endpoints.model_management_endpoints import update_db_model
+
+    stored: Final = LiteLLM_Params.model_validate({"model": "openai/test-model", field: value})
+    deployment: Final = Deployment(
+        model_name="test-model", litellm_params=stored, model_info=ModelInfo(id="null-clear")
+    )
+    result: Final = update_db_model(
+        deployment,
+        updateDeployment(litellm_params=updateLiteLLMParams.model_validate({field: None})),
+    )
+    assert json.loads(result["litellm_params"]) == {
+        key: item for key, item in stored.model_dump(exclude_none=True, exclude_unset=True).items() if key != field
+    }
+
+
+def test_patch_omission_preserves_non_null_defaults_and_provider_extras() -> None:
+    from litellm.proxy.management_endpoints.model_management_endpoints import update_db_model
+
+    stored: Final = LiteLLM_Params.model_validate(
+        {"model": "openai/test-model", "use_litellm_proxy": True, "temperature": 0.7, "api_base": "saved"}
+    )
+    deployment: Final = Deployment(model_name="test-model", litellm_params=stored, model_info=ModelInfo(id="omission"))
+    result: Final = update_db_model(deployment, updateDeployment(litellm_params=updateLiteLLMParams(rpm=10)))
+    assert json.loads(result["litellm_params"]) == {
+        **stored.model_dump(exclude_none=True, exclude_unset=True),
+        "rpm": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("drop_params", False), ("max_retries", 0), ("tags", []), ("extra_body", {}), ("organization", "")),
+)
+def test_patch_retains_supported_false_zero_and_empty_values(
+    field: str, value: JsonValue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper
+    from litellm.proxy.management_endpoints.model_management_endpoints import update_db_model
+
+    monkeypatch.setenv("LITELLM_SALT_KEY", "synthetic-test-salt")
+    deployment: Final = Deployment(
+        model_name="test-model",
+        litellm_params=LiteLLM_Params(model="openai/test-model"),
+        model_info=ModelInfo(id="empty"),
+    )
+    result: Final = update_db_model(
+        deployment, updateDeployment(litellm_params=updateLiteLLMParams.model_validate({field: value}))
+    )
+    params: Final = json.loads(result["litellm_params"])
+    actual: Final = decrypt_value_helper(params[field], key=field) if isinstance(value, str) else params[field]
+    assert actual == value
+    assert type(actual) is type(value)
+
+
+def test_patch_null_for_absent_optional_param_is_harmless() -> None:
+    from litellm.proxy.management_endpoints.model_management_endpoints import update_db_model
+
+    stored: Final = LiteLLM_Params(model="openai/test-model")
+    deployment: Final = Deployment(model_name="test-model", litellm_params=stored, model_info=ModelInfo(id="absent"))
+    result: Final = update_db_model(
+        deployment, updateDeployment(litellm_params=updateLiteLLMParams.model_validate({"extra_body": None}))
+    )
+    assert json.loads(result["litellm_params"]) == stored.model_dump(exclude_none=True, exclude_unset=True)
+
+
+def test_patch_cannot_delete_required_model_or_disclose_credentials() -> None:
+    from litellm.proxy.management_endpoints.model_management_endpoints import update_db_model
+
+    deployment: Final = Deployment(
+        model_name="test-model",
+        litellm_params=LiteLLM_Params(model="openai/test-model"),
+        model_info=ModelInfo(id="required"),
+    )
+    with pytest.raises(ProxyException) as rejected:
+        update_db_model(
+            deployment,
+            updateDeployment(litellm_params=updateLiteLLMParams(model=None, api_key="synthetic-provider-secret")),
+        )
+    assert rejected.value.code == "400"
+    assert rejected.value.param == "litellm_params.model"
+    assert "synthetic-provider-secret" not in rejected.value.message
+
+
+def test_patch_router_validation_uses_the_configuration_after_explicit_clear() -> None:
+    from litellm.proxy.management_endpoints.model_management_endpoints import _strategy_router_write_violation
+
+    stored: Final = LiteLLM_Params(
+        model="auto_router/complexity_router", complexity_router_config={"classifier_type": "heuristic"}
+    )
+    incoming: Final = updateLiteLLMParams(model="openai/test-model", complexity_router_config=None)
+    assert _strategy_router_write_violation(incoming, stored) is None
+    assert _strategy_router_write_violation(updateLiteLLMParams(complexity_router_config=None), stored) is not None
+
+
+def test_cleared_default_flag_is_not_resurrected_by_a_subsequent_patch() -> None:
+    from litellm.proxy.management_endpoints.model_management_endpoints import update_db_model
+
+    deployment: Final = Deployment(
+        model_name="test-model",
+        litellm_params=LiteLLM_Params(model="openai/test-model", use_in_pass_through=True),
+        model_info=ModelInfo(id="default-clear"),
+    )
+    cleared: Final = update_db_model(
+        deployment, updateDeployment(litellm_params=updateLiteLLMParams(use_in_pass_through=None))
+    )
+    reloaded: Final = Deployment(
+        model_name="test-model",
+        litellm_params=LiteLLM_Params.model_validate_json(cleared["litellm_params"]),
+        model_info=deployment.model_info,
+    )
+    result: Final = update_db_model(reloaded, updateDeployment(litellm_params=updateLiteLLMParams(rpm=10)))
+    assert json.loads(result["litellm_params"]) == {"model": "openai/test-model", "rpm": 10}
+
+
+@pytest.mark.parametrize("role", (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.INTERNAL_USER))
+def test_patch_session_tag_deletion_remains_a_proxy_admin_privilege(role: LitellmUserRoles) -> None:
+    params: Final = updateLiteLLMParams(aws_session_tags=None)
+    stored: Final = LiteLLM_Params(model="bedrock/test-model", aws_session_tags=[{"Key": "team", "Value": "saved"}])
+    user: Final = UserAPIKeyAuth(user_role=role)
+    if role == LitellmUserRoles.PROXY_ADMIN:
+        assert ModelManagementAuthChecks.can_user_set_aws_session_tags(params, user, stored, null_detaches=True) is True
+    else:
+        with pytest.raises(ProxyException) as rejected:
+            ModelManagementAuthChecks.can_user_set_aws_session_tags(params, user, stored, null_detaches=True)
+        assert rejected.value.code == "403"
+        assert rejected.value.param == "aws_session_tags"
+    assert ModelManagementAuthChecks.can_user_set_aws_session_tags(params, user, stored) is True
+
+
+def test_patch_clearing_absent_session_tags_is_allowed_for_non_admin() -> None:
+    assert ModelManagementAuthChecks.can_user_set_aws_session_tags(
+        updateLiteLLMParams(aws_session_tags=None),
+        UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER),
+        LiteLLM_Params(model="bedrock/test-model"),
+        null_detaches=True,
+    ) is True
 
 
 async def _passthrough_row(update_data):
@@ -3468,7 +3621,7 @@ class TestUpdateDBModelCompression:
         assert "auto_router_routing_compression" not in params
         assert "auto_router_model_compression" not in params
         assert policy_from_litellm_params(params) is None
-        assert params["api_base"] == "http://127.0.0.1:9999/v1"
+        assert "api_base" not in params
         assert params["temperature"] == 0
         assert json.loads(result["model_info"])["team_id"] == "synthetic-team"
 
@@ -7671,7 +7824,7 @@ class TestTeamMemberAutoRouterWrites:
             user_id="owner", user_role=LitellmUserRoles.INTERNAL_USER, models=["allowed", "laya/english"], config={"timeout": 60},
         )
         with self._environment(database, row):
-            if reset_field is not None:
+            if reset_field is not None or (endpoint == "patch" and config_shape == "null-config"):
                 expected_error: Final = HTTPException if endpoint == "patch" else ProxyException
                 with pytest.raises(expected_error, match="Team members cannot change classifier connections") as denied:
                     await (

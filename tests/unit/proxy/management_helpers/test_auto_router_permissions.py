@@ -280,9 +280,14 @@ async def test_member_authorization_and_persistence_resolve_the_same_classifier(
             **({} if nested == "omit-block" else {"jev_classifier_config": nested}),
         }
     )
-    patch: Final = updateDeployment.model_validate({"litellm_params": {
-        "complexity_router_config": incoming_config, "complexity_router_default_model": "allowed",
-    }})
+    patch: Final = updateDeployment.model_validate(
+        {
+            "litellm_params": {
+                **({} if nested == "omit-config" else {"complexity_router_config": incoming_config}),
+                "complexity_router_default_model": "allowed",
+            }
+        }
+    )
     operation: Final = authorize_member_auto_router_write(
         incoming=patch, existing=existing, user_api_key_dict=_actor(
             models=["allowed"] if restricted or expected_identity is None else ["allowed", expected_identity],

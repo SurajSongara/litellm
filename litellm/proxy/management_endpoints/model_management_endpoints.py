@@ -162,8 +162,6 @@ if TYPE_CHECKING:
     from prisma import types as prisma_types
 
 router: Final = APIRouter()
-CLEARABLE_LITELLM_PARAMS: Final = frozenset({"cache_control_injection_points", "litellm_credential_name"})
-NULL_CLEARABLE_LITELLM_PARAMS: Final = frozenset((*SPECIAL_MODEL_INFO_PARAMS, *CLEARABLE_LITELLM_PARAMS))
 
 
 async def update_team(*args, **kwargs):
@@ -308,6 +306,8 @@ async def get_db_model(model_id: str, prisma_client: PrismaClient) -> Deployment
 def _strategy_router_write_violation(
     incoming_params: GenericLiteLLMParams | None,
     existing_params: GenericLiteLLMParams | None,
+    *,
+    null_clears: bool = True,
 ) -> str | None:
     """Reject writes that would corrupt a strategy router's pseudo-model.
 
@@ -326,7 +326,7 @@ def _strategy_router_write_violation(
         return None
     config_violation: Final = validate_complexity_router_config_write(
         complexity_router_config=(
-            _effective_complexity_router_config(incoming_params, existing_params)
+            _effective_complexity_router_config(incoming_params, existing_params, null_clears=null_clears)
             if incoming_params.complexity_router_config is not None
             else None
         )
@@ -336,10 +336,16 @@ def _strategy_router_write_violation(
     present_fields: Final = frozenset(
         field
         for field in STRATEGY_ROUTER_PARAM_FIELDS
-        for source in (incoming_params, existing_params)
-        if source is not None and getattr(source, field, None) is not None
+        if getattr(incoming_params, field, None) is not None
+        or (
+            existing_params is not None
+            and getattr(existing_params, field, None) is not None
+            and not (null_clears and field in incoming_params.model_fields_set)
+        )
     )
-    effective_params: Final = _effective_complexity_router_params(incoming_params, existing_params)
+    effective_params: Final = _effective_complexity_router_params(
+        incoming_params, existing_params, null_clears=null_clears
+    )
     effective_model: Final = effective_params.get("model")
     if carries_complexity_router_settings(
         effective_model if isinstance(effective_model, str) else None, present_fields
@@ -356,8 +362,12 @@ def _strategy_router_write_violation(
 def _raise_on_strategy_router_write_violation(
     incoming_params: GenericLiteLLMParams | None,
     existing_params: GenericLiteLLMParams | None,
+    *,
+    null_clears: bool = True,
 ) -> None:
-    violation = _strategy_router_write_violation(incoming_params=incoming_params, existing_params=existing_params)
+    violation: Final = _strategy_router_write_violation(
+        incoming_params=incoming_params, existing_params=existing_params, null_clears=null_clears
+    )
     if violation is None:
         return
     raise ProxyException(
@@ -454,8 +464,18 @@ WHERE model_id <> $1
 
 
 def _effective_complexity_router_config(
-    incoming_params: GenericLiteLLMParams | None, existing_params: GenericLiteLLMParams | None
+    incoming_params: GenericLiteLLMParams | None,
+    existing_params: GenericLiteLLMParams | None,
+    *,
+    null_clears: bool = False,
 ) -> Mapping[str, object] | None:
+    if (
+        null_clears
+        and incoming_params is not None
+        and "complexity_router_config" in incoming_params.model_fields_set
+        and incoming_params.complexity_router_config is None
+    ):
+        return None
     incoming: Final = None if incoming_params is None else incoming_params.complexity_router_config
     existing: Final = None if existing_params is None else existing_params.complexity_router_config
     config_adapter: Final[TypeAdapter[Mapping[str, object] | None]] = TypeAdapter(Mapping[str, object] | None)
@@ -498,13 +518,18 @@ def _effective_model(
 
 
 def _effective_complexity_router_params(
-    incoming_params: GenericLiteLLMParams | None, existing_params: GenericLiteLLMParams | None
+    incoming_params: GenericLiteLLMParams | None,
+    existing_params: GenericLiteLLMParams | None,
+    *,
+    null_clears: bool = False,
 ) -> Mapping[str, object]:
     """The model and complexity config a write leaves, for placement and capability decisions."""
     return MappingProxyType(
         {
             "model": _effective_model(incoming_params, existing_params),
-            "complexity_router_config": _effective_complexity_router_config(incoming_params, existing_params),
+            "complexity_router_config": _effective_complexity_router_config(
+                incoming_params, existing_params, null_clears=null_clears
+            ),
         }
     )
 
@@ -1018,10 +1043,21 @@ def update_db_model(
     updated_patch: updateDeployment,
     loaded_catalog: LoadedCatalog = GetModelCostMap.loaded_model_cost_map,
 ) -> PrismaCompatibleUpdateDBModel:
+    if (
+        updated_patch.litellm_params is not None
+        and "model" in updated_patch.litellm_params.model_fields_set
+        and updated_patch.litellm_params.model is None
+    ):
+        raise ProxyException(
+            message="litellm_params.model cannot be null.",
+            type=ProxyErrorTypes.validation_error.value,
+            code=status.HTTP_400_BAD_REQUEST,
+            param="litellm_params.model",
+        )
     if updated_patch.model_info is not None:
         _raise_if_ptu_cost_attribution_disabled(updated_patch.model_info.model_dump(exclude_none=True))
     merged_model_name: Final = updated_patch.model_name or db_model.model_name
-    merged_litellm_params: Final = db_model.litellm_params.model_dump(exclude_none=True)
+    merged_litellm_params: Final = db_model.litellm_params.model_dump(exclude_none=True, exclude_unset=True)
     stored_model_info: Final = db_model.model_info.model_dump(exclude_none=True)
     echoed_pricing: Final = echoed_cost_map_pricing_fields(stored_model_info)
     merged_model_info: Final[dict[str, object]] = {
@@ -1037,7 +1073,7 @@ def update_db_model(
                 if k == "complexity_router_config"
                 else encrypt_value_helper(v)
             )
-            for k, v in updated_patch.litellm_params.model_dump(exclude_none=True).items()
+            for k, v in updated_patch.litellm_params.model_dump(exclude_none=True, exclude_unset=True).items()
         }
 
         merged_litellm_params.update(encrypted_params)
@@ -1066,25 +1102,13 @@ def update_db_model(
     # Honor explicit-null clears LAST, after both merges, so a model_info blob a client
     # passes through cannot silently undo a litellm_params clear via .update().
     #
-    # Restricted to SPECIAL_MODEL_INFO_PARAMS (input/output cost per token/character
-    # and cache read/write costs) so this path cannot be used to null out privileged
-    # model_info fields like team_id or access groups. SPECIAL_MODEL_INFO_PARAMS are
-    # mirrored between litellm_params and model_info by Deployment.__init__, so the
-    # clear propagates to both blobs.
+    # SPECIAL_MODEL_INFO_PARAMS are mirrored by Deployment.__init__, so clear both blobs.
     if updated_patch.litellm_params:
         for field in updated_patch.litellm_params.model_fields_set:
-            if getattr(updated_patch.litellm_params, field) is None and field in NULL_CLEARABLE_LITELLM_PARAMS:
+            if getattr(updated_patch.litellm_params, field) is None:
                 merged_litellm_params.pop(field, None)
-                merged_model_info.pop(field, None)
-            elif (
-                field
-                in (
-                    "auto_router_routing_compression",
-                    "auto_router_model_compression",
-                )
-                and getattr(updated_patch.litellm_params, field) is None
-            ):
-                merged_litellm_params.pop(field, None)
+                if field in SPECIAL_MODEL_INFO_PARAMS:
+                    merged_model_info.pop(field, None)
     if updated_patch.model_info:
         for field in updated_patch.model_info.model_fields_set:
             if field in SPECIAL_MODEL_INFO_PARAMS and getattr(updated_patch.model_info, field) is None:
@@ -1207,6 +1231,13 @@ async def patch_model(
             incoming_model_params=patch_data,
         )
         member_write: Final = write_authorization if isinstance(write_authorization, MemberAutoRouterWrite) else None
+        if (
+            member_write is not None
+            and patch_data.litellm_params is not None
+            and "complexity_router_config" in patch_data.litellm_params.model_fields_set
+            and patch_data.litellm_params.complexity_router_config is None
+        ):
+            raise HTTPException(status_code=403, detail="Team members cannot change classifier connections.")
         member_marker: Final = _member_auto_router_marker_for_update(
             incoming_params=patch_data.litellm_params, existing=db_model, member_write=member_write
         )
@@ -1256,6 +1287,7 @@ async def patch_model(
             litellm_params=patch_data.litellm_params,
             user_api_key_dict=user_api_key_dict,
             existing_litellm_params=db_model.litellm_params,
+            null_detaches=True,
         )
 
         _raise_on_strategy_router_write_violation(
@@ -1264,7 +1296,7 @@ async def patch_model(
         )
 
         effective_params: Final = _effective_complexity_router_params(
-            patch_data.litellm_params, db_model.litellm_params
+            patch_data.litellm_params, db_model.litellm_params, null_clears=True
         )
         requested_model_name: Final = patch_data.model_name
         stored_model_name: str | None = None
@@ -2098,14 +2130,22 @@ class ModelManagementAuthChecks:
         litellm_params: GenericLiteLLMParams | None,
         user_api_key_dict: UserAPIKeyAuth,
         existing_litellm_params: GenericLiteLLMParams | None = None,
+        *,
+        null_detaches: bool = False,
     ) -> Literal[True]:
-        if litellm_params is None or litellm_params.aws_session_tags is None:
+        if litellm_params is None or "aws_session_tags" not in litellm_params.model_fields_set:
+            return True
+        if litellm_params.aws_session_tags is None and not null_detaches:
             return True
         if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
             return True
         existing_tags: Final = existing_litellm_params.aws_session_tags if existing_litellm_params is not None else None
-        if existing_tags is not None and _canonical_session_tags(existing_tags) == _canonical_session_tags(
-            litellm_params.aws_session_tags
+        if existing_tags is None and litellm_params.aws_session_tags is None:
+            return True
+        if (
+            existing_tags is not None
+            and litellm_params.aws_session_tags is not None
+            and _canonical_session_tags(existing_tags) == _canonical_session_tags(litellm_params.aws_session_tags)
         ):
             return True
         raise ProxyException(
@@ -2745,6 +2785,7 @@ async def update_model(
         _raise_on_strategy_router_write_violation(
             incoming_params=model_params.litellm_params,
             existing_params=deployment.litellm_params,
+            null_clears=False,
         )
         effective_params: Final = _effective_complexity_router_params(
             model_params.litellm_params, deployment.litellm_params
